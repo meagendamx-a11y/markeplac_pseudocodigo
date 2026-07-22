@@ -1,0 +1,91 @@
+/* =====================================================================================
+   tokens.css — Sistema de diseño de Agenda Psi como variables CSS.
+   Fuente única: agenda-psi-database/DISENO_UI.md. MISMOS tokens que la app profesional
+   (app_tokens.dart); cambia la DENSIDAD y el USO (audiencia paciente = más cálida), NUNCA
+   la paleta ni la tipografía (DISENO_UI §0). Nada ad-hoc: todo color/tamaño/radio sale de aquí.
+   ===================================================================================== */
+:root {
+  /* --- Marca / morado (§2). #E8E6FF NUNCA es texto ni botón, solo tint (§1,§8). --- */
+  --purple-50:  #F5F4FB;  /* fondo de página interno */
+  --purple-100: #EDEBFA;  /* superficies tintadas (banner, badge, icono en círculo) */
+  --purple-200: #E8E6FF;  /* tono de marca — SOLO tint */
+  --purple-300: #C7C2E4;  /* bordes sobre tint */
+  --purple-600: #574FA8;  /* PRIMARIO DE ACCIÓN (morado templado) */
+  --purple-700: #453D87;  /* texto/ícono sobre tint, links */
+  --purple-900: #251F52;  /* reserva de contraste */
+
+  /* --- Neutros ink (leve sesgo lavanda, nunca gris puro) (§2) --- */
+  --ink-900: #1C1830;  /* texto principal, valores */
+  --ink-700: #423C5C;  /* secundario con énfasis */
+  --ink-500: #6F6889;  /* muted, labels, metadatos */
+  --ink-300: #A8A2C2;  /* bordes de botón neutro, chevrons, disabled */
+  --ink-100: #E4E1F2;  /* fondo de chips descriptivos, timeline */
+  --border:  #E9E6F5;  /* borde estándar de tarjetas/inputs */
+  --surface: #FFFFFF;  /* tarjetas, inputs, sheets */
+  --white:   #FFFFFF;  /* fondo de flujos de captura (excepción, §0) */
+
+  /* --- Semánticos (§2) --- */
+  --success-600: #4A8F6C;  --success-700: #3A7257;  --success-100: #E3F3EA;
+  --amber-600:   #C97A1F;  --amber-700:   #9C5F16;  --amber-100:   #FFF0DC;
+  --danger-600:  #C14C5B;  --danger-100:  #FBEAEC;
+  --info-600:    #2F6DF6;  /* azul a propósito: libera el morado (§2) */
+
+  --scrim: rgba(28,24,48,.42);  /* scrim de modales + blur 1.5px */
+
+  /* --- Tipografía (§3): Display=Sora (600/700/800), Body=IBM Plex Sans (400..700) --- */
+  --font-display: 'Sora', system-ui, sans-serif;
+  --font-body: 'IBM Plex Sans', system-ui, sans-serif;
+  /* Cifras en columna: font-variant-numeric: tabular-nums (aplicar en .num). */
+
+  /* --- Forma (§4): radios reducidos (más serio) --- */
+  --radius-sm: 6px;    /* inputs de hora, bloques de timeline */
+  --radius-md: 10px;   /* inputs, selects, botones secundarios */
+  --radius-lg: 14px;   /* CTA primario, botones grandes */
+  --radius-xl: 18px;   /* tarjetas */
+  --radius-round: 12px;/* chips, pills */
+  --radius-sheet: 26px;/* esquinas superiores de sheet */
+
+  /* --- Espaciado: escala 4/8 (§4) --- */
+  --s4: 4px; --s8: 8px; --s12: 12px; --s16: 16px; --s20: 20px; --s24: 24px; --s32: 32px;
+
+  --min-touch: 44px;  /* área táctil mínima (§8) */
+}
+
+/* Base tipográfica y de página (audiencia paciente: cálida pero mismos tokens). */
+html { color-scheme: light; }
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  color: var(--ink-900);
+  background: var(--purple-50);
+  -webkit-font-smoothing: antialiased;
+}
+.num { font-variant-numeric: tabular-nums; }
+
+/* Foco visible SIEMPRE (§8) — no quitar outline sin reemplazo accesible. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--purple-600);
+  outline-offset: 2px;
+}
+
+/* CTA primario (§5.2): morado sólido, Sora 700, radius-lg. Uno por pantalla. */
+.cta-primary {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: var(--min-touch); padding: 0 var(--s20);
+  background: var(--purple-600); color: var(--white);
+  font-family: var(--font-display); font-weight: 700; font-size: 16px;
+  border: 0; border-radius: var(--radius-lg); cursor: pointer;
+}
+.cta-primary:disabled { opacity: .55; cursor: not-allowed; }
+
+/* Botón secundario neutro (§5.3): borde ink-300, texto ink-900, fondo blanco. */
+.btn-secondary {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: var(--min-touch); padding: 0 var(--s16);
+  background: var(--surface); color: var(--ink-900);
+  font-family: var(--font-body); font-weight: 600; font-size: 14px;
+  border: 1px solid var(--ink-300); border-radius: var(--radius-md); cursor: pointer;
+}
+
+/* Tarjeta (§5.19): radius-xl, borde border. */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-xl); }

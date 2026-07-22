@@ -1,0 +1,27 @@
+{
+  "name": "markeplac_pseudocodigo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agenda Psi — marketplace paciente (superficie web, pseudocódigo Next.js).",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "stripe": "^17.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.0.0"
+  },
+  "//": "Stack ASUMIDO (Next.js App Router + TS). El service_role de Supabase solo vive en variables de entorno del SERVIDOR; el navegador nunca lo ve. Ver README (decisión confirmable de cierre)."
+}
