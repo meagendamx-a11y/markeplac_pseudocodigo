@@ -196,14 +196,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     result = await rpcService<VerifyOtpResult>('verify_marketplace_phone_otp', {
       p_slug: slug,
       p_hold_id: session.active_hold_id, // ← de la cookie, no del body
-      p_marketplace_session_id: session.marketplace_session_id,
-      p_professional_id: session.professional_id,
       p_phone: phone,
       p_otp_code: otpCode,
+      p_marketplace_session_id: session.marketplace_session_id,
       // Estado de verificación previo: "si la cookie ya tiene verified_phone = phone vigente,
-      // saltar Twilio" (MARKETPLACE.md § verify, Flujo 2).
-      p_verified_phone: session.verified_phone,
-      p_phone_verified_at: session.phone_verified_at,
+      // saltar Twilio" (MARKETPLACE.md § verify, Flujo 2). Nombres p_cookie_* según la firma
+      // real de la RPC (que NO declara professional_id: el tenant se deriva del slug + hold).
+      p_cookie_verified_phone: session.verified_phone,
+      p_cookie_phone_verified_at: session.phone_verified_at,
     });
   } catch (err) {
     if (err instanceof MarketplaceRpcError) return errorResponse(err.code);

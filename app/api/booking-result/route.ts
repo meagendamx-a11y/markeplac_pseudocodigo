@@ -213,14 +213,14 @@ export async function GET(req: Request): Promise<NextResponse> {
   let raw: BookingResultRpc;
   try {
     raw = await rpcPublic<BookingResultRpc>('get_marketplace_booking_result', {
-      // Los nombres ligan con la firma SQL del contrato (§Entrada, ~L865).
-      slug: query.slug,
-      // Ancla de confianza: el hold y la sesión salen de la COOKIE firmada, no de la query.
-      hold_id: session.active_hold_id,
-      marketplace_session_id: session.marketplace_session_id,
+      // Los nombres de estos parámetros ligan con la firma SQL real de la función (prefijo p_).
+      p_slug: query.slug,
+      // Ancla de confianza: la sesión y el hold salen de la COOKIE firmada, no de la query.
+      p_marketplace_session_id: session.marketplace_session_id,
+      p_hold_id: session.active_hold_id,
       // Pistas del retorno de Stripe (el RPC las cruza; no las trata como verdad).
-      stripe_checkout_session_id: query.stripe_checkout_session_id,
-      result_hint: query.result_hint,
+      p_stripe_checkout_session_id: query.stripe_checkout_session_id,
+      p_result_hint: query.result_hint,
     });
   } catch (e) {
     return mapError(e);

@@ -132,24 +132,21 @@ export async function POST(req: Request): Promise<NextResponse> {
     return ack('ignored', false, 200, { ignored: true, type: event.type });
   }
 
-  // 4) Delegar a la RPC idempotente y transaccional. Le pasamos el evento YA VERIFICADO:
-  //      · event_id     → clave de idempotencia + fila en `stripe_webhook_events` (§805).
-  //      · type/payload → la RPC re-lee el objeto Session del payload para validar
-  //                       status/payment_status/mode/currency/amount_total/PaymentIntent
-  //                       contra el SNAPSHOT del hold (§799-803). NO confiamos en el cliente.
-  //      · event_created→ necesario para la "regla de hold resoluble" (§810-811:
-  //                       resoluble solo si `event.created <= slot_holds.expires_at`).
-  //    La firma NO se re-verifica dentro de Postgres (ya se verificó en Node, antes del lock,
-  //    MARKETPLACE.md §806-807: jamás HTTP/verificación de firma bajo el `agenda_lock`).
+  // 4) Delegar a la RPC idempotente y transaccional. Su firma real es
+  //    `handle_stripe_checkout_completed(p_raw_body text, p_stripe_signature text)`: recibe el
+  //    RAW body y la cabecera Stripe-Signature TAL CUAL llegaron, y hace TODO adentro —
+  //    reconstruye/verifica el evento con `_mp_stripe_construct_event` sobre el raw body ANTES
+  //    de parsear y antes del lock (MARKETPLACE.md §797, §806-807), extrae el `event_id` para la
+  //    idempotencia + fila en `stripe_webhook_events` (§805), re-lee la Session del payload para
+  //    validar status/payment_status/mode/currency/amount_total/PaymentIntent contra el SNAPSHOT
+  //    del hold (§799-803) y usa `event.created` para la "regla de hold resoluble" (§810-811).
+  //    NO le pasamos campos ya parseados en Node: el `event` de arriba es solo para el filtro de
+  //    tipo y la respuesta; la firma la RE-verifica la RPC (fuente de verdad de la autenticación).
   let result: WebhookRpcResult;
   try {
     result = await rpcService<WebhookRpcResult>('handle_stripe_checkout_completed', {
-      event_id: event.id,
-      type: event.type,
-      event_created: event.created,
-      // El payload viaja como JSON crudo verificado; la RPC lo persiste tal cual en
-      // `stripe_webhook_events.payload (jsonb)` y extrae de ahí la Session (§184-189).
-      payload: JSON.parse(rawBody),
+      p_raw_body: rawBody,
+      p_stripe_signature: signature,
     });
   } catch (e) {
     return mapError(e);

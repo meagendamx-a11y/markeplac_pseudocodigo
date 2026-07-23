@@ -191,15 +191,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     result = await rpcService<StartVerificationResult>('start_marketplace_phone_verification', {
       p_slug: slug,
       p_hold_id: session.active_hold_id, // ← de la cookie, no del body
-      p_marketplace_session_id: session.marketplace_session_id,
-      p_professional_id: session.professional_id,
       p_first_name: firstName,
       p_last_name: lastName,
       p_phone: phone,
+      p_marketplace_session_id: session.marketplace_session_id,
+      // Campos de cookie que el edge/BFF pasa server-side (nombres con prefijo p_cookie_*
+      // según la firma real de la RPC). El professional_id/active_hold_id de la cookie sirven
+      // para contrastar contra el slug y el hold; jamás llegan del body.
+      p_cookie_professional_id: session.professional_id,
+      p_cookie_active_hold_id: session.active_hold_id,
       // Estado de verificación previo (para "si la cookie ya tiene verified_phone = phone
       // vigente ⇒ no reenvía OTP", MARKETPLACE.md § Validación / Flujo paso "ya verificado").
-      p_verified_phone: session.verified_phone,
-      p_phone_verified_at: session.phone_verified_at,
+      p_cookie_verified_phone: session.verified_phone,
+      p_cookie_phone_verified_at: session.phone_verified_at,
       // Rate-limit persistente por IP (§ Rate limiting (a): "por IP: ventana propia").
       p_ip_address: clientIp(req),
     });

@@ -17,22 +17,21 @@
 //     STRIPE_CHECKOUT_FAILED.
 //   También MARKETPLACE.md § marketplace-pago.md (paso 4 de 4) y § Máquina de estados (~L272).
 //
-// FRONTERA Node/Postgres — por qué la función lógica se materializa en DOS llamadas RPC:
-//   El contrato describe `create_marketplace_checkout_from_hold` como UNA operación: lock →
-//   validar → crear Session Stripe → congelar `amount` → persistir `stripe_checkout_session_id`
-//   → alinear `expires_at`. Pero una RPC de Postgres NO puede hablar HTTP con Stripe (y jamás
-//   se hace HTTP bajo el `agenda_lock`, MARKETPLACE.md §807). Por eso este handler orquesta:
-//     Fase `prepare` (RPC, service_role): `FOR UPDATE` sobre el hold, revalida cookie/teléfono
-//        contra `patient_phone`, revalida `whatsapp_links` (→ MARKETPLACE_BLOCKED_EXISTING_PATIENT),
-//        revalida que el slot siga protegido (→ SLOT_UNAVAILABLE), **congela `slot_holds.amount`**
-//        (INC-6) y devuelve los ids/monto necesarios. Si el hold YA tiene Session, la devuelve
-//        para recuperarla (idempotencia por hold).
-//     Stripe (lib/stripe): `createCheckoutFromHold` con idempotencyKey `marketplace_checkout:{hold_id}`.
-//     Fase `attach` (RPC, service_role): re-`FOR UPDATE`, comprueba que nadie adjuntó otra Session
-//        entretanto (carrera de doble pestaña ⇒ CHECKOUT_ALREADY_STARTED), guarda
-//        `stripe_checkout_session_id` y alinea `expires_at`/`checkout_expires_at` a la ventana Stripe.
-//   La `stripe_checkout_session_id` persistida es el ancla de idempotencia: dos pestañas no
-//   generan dos cobros; el webhook además valida contra el snapshot del hold.
+// UNA SOLA RPC (alineado a create_marketplace_checkout_from_hold.sql):
+//   La función es UNA operación indivisible con la firma
+//     create_marketplace_checkout_from_hold(p_slug, p_hold_id, p_marketplace_session_id,
+//                                            p_verified_phone) RETURNS jsonb.
+//   Bajo el `FOR UPDATE` del hold hace todo: lock → revalidar cookie/teléfono contra
+//   `patient_phone` → revalidar `whatsapp_links` (→ MARKETPLACE_BLOCKED_EXISTING_PATIENT) →
+//   revalidar que el slot siga protegido (→ SLOT_UNAVAILABLE) → **congelar `slot_holds.amount`**
+//   (INC-6) → crear la Stripe Checkout Session (modelada por los helpers server-side
+//   `_mp_stripe_create_checkout_session` / `_mp_stripe_retrieve_checkout_session`, orquestados
+//   por el edge en el despliegue real) → persistir `stripe_checkout_session_id` → alinear
+//   `expires_at`/`checkout_expires_at` a la ventana Stripe → devolver la URL. Este handler NO
+//   orquesta Stripe ni encadena fases: llama a la RPC una vez y traduce su `jsonb` a HTTP.
+//   La idempotencia es por clave natural del hold (uq_slot_holds_checkout): si el hold ya tenía
+//   Session, la RPC la recupera de Stripe y responde `continue_checkout` (open) / `view_result`
+//   (complete) / CHECKOUT_EXPIRED (expired) — sin crear ni cobrar dos veces.
 //
 // INVARIANTES DE SEGURIDAD DUROS (MARKETPLACE.md) que este archivo materializa:
 //   1) La cita NO nace aquí. Este handler NO crea patients/appointments/marketplace_payments ni
@@ -40,17 +39,16 @@
 //      `handle_stripe_checkout_completed`. La URL `success` de Stripe NO confirma nada; la pantalla
 //      de resultado hace polling (MARKETPLACE.md §780, marketplace-pago.md §6).
 //   2) El `service_role` JAMÁS llega al navegador: `rpcService` vive en lib/supabase-server
-//      (`import 'server-only'`), igual que el cliente Stripe (lib/stripe, `import 'server-only'`).
-//      El browser hace `POST {slug, hold_id}` y luego `window.location = url`; NUNCA habla con
-//      Supabase ni con la Secret Key de Stripe.
+//      (`import 'server-only'`). El browser hace `POST {slug, hold_id}` y luego
+//      `window.location = url`; NUNCA habla con Supabase ni con la Secret Key de Stripe.
 //   3) El backend NO confía en el frontend: precio, moneda y success/cancel URLs se resuelven
-//      SERVER-SIDE. `amount` es el SNAPSHOT congelado del hold (`slot_holds.amount`), no un precio
-//      del cliente (MARKETPLACE.md §780). `professional_id`/`service_id` se re-resuelven desde el
-//      `slug` en la RPC; de la cookie tampoco: el estado real (hold vigente, teléfono verificado)
-//      se revalida bajo lock.
+//      SERVER-SIDE dentro de la RPC. `amount` es el SNAPSHOT congelado del hold
+//      (`slot_holds.amount`), no un precio del cliente (MARKETPLACE.md §780).
+//      `professional_id`/`service_id` se re-resuelven desde el `slug`; de la cookie tampoco: el
+//      estado real (hold vigente, teléfono verificado) se revalida bajo lock.
 //   4) La cookie la fija el SERVIDOR (firmada+cifrada, allowlist estricta, lib/session-cookie).
-//      `verified_phone` se toma de ahí y se pasa a la RPC para revalidar `patient_phone`; NUNCA
-//      del body. Nada de OTP/Stripe/PII cruda en la respuesta.
+//      `verified_phone` y `marketplace_session_id` se toman de ahí y se pasan a la RPC como
+//      `p_verified_phone` / `p_marketplace_session_id`; NUNCA del body.
 //   5) Sin datos clínicos ni de pago en la respuesta: al cliente solo van la `url` de Stripe, el
 //      vencimiento y los campos públicos del hold. La `stripe_checkout_session_id` NO se devuelve
 //      (viaja sola en la success URL que arma Stripe). Los errores se mapean a códigos de dominio.
@@ -60,72 +58,64 @@ import { NextResponse } from 'next/server';
 
 import { rpcService, MarketplaceRpcError } from '../../../lib/supabase-server';
 import {
-  createCheckoutFromHold,
-  getStripe,
-  StripeGatewayError,
-} from '../../../lib/stripe';
-import {
   getBookingSession,
   type BookingSession,
 } from '../../../lib/session-cookie';
 
 // Checkout depende de disponibilidad viva (el hold vence, el slot puede ocuparse) y usa
-// service_role + crypto de la cookie + Stripe ⇒ jamás cachear, y ejecutar en Node.
+// service_role + crypto de la cookie ⇒ jamás cachear, y ejecutar en Node.
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 // -------------------------------------------------------------------------------------
-// Tipos públicos del hold (espejo del sub-objeto que ya devuelve /api/hold). Sin
-// precio/tz-verdad/PII/clínico: solo horario y vencimiento.
+// Tipos públicos del hold (espejo del sub-objeto `hold` que devuelve la RPC). Sin
+// precio-del-cliente/tz-verdad/PII/clínico: solo estado, horario y vencimiento.
 // -------------------------------------------------------------------------------------
 
 /** Estado del hold (MARKETPLACE.md § hold_status). En este paso debe seguir `held`. */
 type HoldStatus = 'held' | 'expired' | 'converted';
 
-/** Sub-objeto público del hold que SÍ ve el cliente. */
+/**
+ * Sub-objeto público del hold que devuelve la RPC. En la rama `view_result` (pago ya
+ * completado) la RPC solo emite `{ id, status }`; por eso el resto es opcional.
+ */
 interface HoldPublic {
   id: string;
-  starts_at: string; // ISO UTC (autoritativo del backend)
-  ends_at: string; // ISO UTC
-  starts_at_local: string; // rótulo en la tz del PROFESIONAL (autoritativa)
-  ends_at_local: string;
-  expires_at: string; // ISO UTC — tras `attach`, alineado a la ventana de Stripe (≥ 30 min)
   status: HoldStatus;
+  starts_at?: string; // ISO UTC (autoritativo del backend)
+  ends_at?: string; // ISO UTC
+  expires_at?: string; // ISO UTC — alineado a la ventana de Stripe (≥ 30 min)
+  amount?: number; // SNAPSHOT congelado del hold (MXN), solo en la creación
 }
 
 // -------------------------------------------------------------------------------------
-// Salidas de las fases RPC (server-side). Espejo de `create_marketplace_checkout_from_hold`.
+// Salida de `create_marketplace_checkout_from_hold` (jsonb). Unión de sus ramas:
+//   · creación         → { checkout{url,...}, hold, next_action:'redirect_to_checkout' }
+//   · recuperación open → { checkout{url,...}, hold, next_action:'continue_checkout', idempotent }
+//   · pago completado   → { checkout{status:'complete'}, hold{id,status}, next_action:'view_result' }
+//   · ya-paciente       → { marketplace_allowed:false, reason, next_action:'continue_whatsapp' }
+// (los estados terminales — HOLD_EXPIRED, CHECKOUT_EXPIRED, SLOT_UNAVAILABLE,
+//  CHECKOUT_ALREADY_STARTED, STRIPE_CHECKOUT_FAILED — llegan como RAISE ⇒ MarketplaceRpcError.)
 // -------------------------------------------------------------------------------------
 
-/**
- * Fase `prepare`: lock + validación + congelado de `amount`. Devuelve los datos mínimos que el
- * handler necesita para crear la Session en Stripe (todo autoritativo, re-resuelto desde el slug),
- * o —si el hold ya arrancó Checkout— la `stripe_checkout_session_id` existente para recuperarla.
- */
-interface CheckoutPrepareResult {
-  /** true ⇒ el hold ya tiene Session; recuperar de Stripe en vez de crear otra (idempotencia). */
-  has_existing_checkout: boolean;
-  /** Session ya adjunta al hold (solo si `has_existing_checkout`). */
-  stripe_checkout_session_id: string | null;
-  /** Ids re-resueltos desde el slug — NUNCA se confían al cliente. */
-  professional_id: string;
-  service_id: string;
-  /** Ancla del flujo; el webhook revalida que la metadata de la Session coincida (§803). */
-  marketplace_session_id: string;
-  /** SNAPSHOT congelado del hold (`slot_holds.amount == default_price`), en MXN. */
-  amount: number;
-  /** Nombre del profesional para el line item (display, no autoritativo). */
-  professional_name: string | null;
-  /** Campos públicos del hold, para reflejar el contador en la pantalla si hace falta. */
-  hold: HoldPublic;
-}
-
-/**
- * Fase `attach`: persiste `stripe_checkout_session_id` y alinea `expires_at`/`checkout_expires_at`
- * a la ventana Stripe, bajo `FOR UPDATE`. Si otra pestaña adjuntó primero ⇒ CHECKOUT_ALREADY_STARTED.
- */
-interface CheckoutAttachResult {
-  hold: HoldPublic;
+interface CheckoutResult {
+  /** Rama "ya es paciente de este profesional": se devuelve como fila, no como excepción. */
+  marketplace_allowed?: false;
+  reason?: string;
+  /** Datos de la Session (creada o recuperada). `url` ausente cuando el pago ya se completó. */
+  checkout?: {
+    stripe_checkout_session_id?: string; // NUNCA se reenvía al cliente (Invariante 5)
+    url?: string;
+    expires_at?: string;
+    status?: string; // 'complete' ⇒ ya pagado
+  };
+  hold?: HoldPublic;
+  next_action:
+    | 'redirect_to_checkout'
+    | 'continue_checkout'
+    | 'view_result'
+    | 'continue_whatsapp';
+  idempotent?: boolean;
 }
 
 // -------------------------------------------------------------------------------------
@@ -170,12 +160,13 @@ export async function POST(req: Request): Promise<NextResponse> {
     return errorJson('INVALID_INPUT', 422);
   }
 
-  // 2) Cookie del flujo (NO autoritativa, pero es de dónde sale `verified_phone`). Sin cookie
-  //    vigente no hay flujo ⇒ BOOKING_SESSION_REQUIRED. Precondiciones baratas antes de tocar DB:
+  // 2) Cookie del flujo (NO autoritativa, pero es de dónde salen `verified_phone` y
+  //    `marketplace_session_id`). Sin cookie vigente no hay flujo ⇒ BOOKING_SESSION_REQUIRED.
+  //    Precondiciones baratas antes de tocar DB:
   //    · el hold del body debe ser el `active_hold_id` de la cookie (Invariante 2: no operar un
   //      hold ajeno al flujo) ⇒ BOOKING_SESSION_MISMATCH.
   //    · debe existir `verified_phone` ⇒ si no, el paciente aún no pasó el OTP (PHONE_NOT_VERIFIED).
-  //    La RPC revalida TODO a fondo bajo lock (vigencia OTP, patient_phone, whatsapp_links).
+  //    La RPC revalida TODO a fondo bajo lock (vigencia, patient_phone, whatsapp_links, slot).
   const session: BookingSession | null = await getBookingSession();
   if (!session) return flowError('BOOKING_SESSION_REQUIRED', 'verify_phone');
   if (session.active_hold_id !== body.hold_id) {
@@ -183,160 +174,58 @@ export async function POST(req: Request): Promise<NextResponse> {
   }
   if (!session.verified_phone) return flowError('PHONE_NOT_VERIFIED', 'verify_phone');
 
-  // 3) Fase `prepare` (PRIVILEGIADA). En UNA transacción corta: `FOR UPDATE` del hold; revalida
-  //    vigencia y que sea del mismo flujo (`marketplace_session_id`); `patient_phone == verified_phone`;
-  //    revalida `whatsapp_links` (ya-paciente ⇒ hold `expired` + MARKETPLACE_BLOCKED_EXISTING_PATIENT);
-  //    servicio con `default_price > 0` en MXN; slot aún protegido (sin cita/otro hold). Congela
-  //    `slot_holds.amount` y devuelve ids/monto. NO crea cita/paciente/pago, NO llama a Stripe.
-  let prep: CheckoutPrepareResult;
+  // 3) RPC ÚNICA (PRIVILEGIADA). Firma real: (p_slug, p_hold_id, p_marketplace_session_id,
+  //    p_verified_phone). La RPC re-resuelve professional/service/precio desde el slug; el
+  //    teléfono y la sesión vienen de la cookie firmada (server-side), jamás del body. Ella
+  //    crea/recupera la Session en Stripe bajo el `FOR UPDATE` y congela `slot_holds.amount`.
+  let result: CheckoutResult;
   try {
-    prep = await rpcService<CheckoutPrepareResult>('create_marketplace_checkout_from_hold', {
-      phase: 'prepare',
-      slug: body.slug,
-      hold_id: body.hold_id,
-      // La RPC re-resuelve professional/service/precio desde el slug; el teléfono viene de la
-      // cookie firmada (server-side), jamás del body, y se compara contra `patient_phone`.
-      verified_phone: session.verified_phone,
-      marketplace_session_id: session.marketplace_session_id,
+    result = await rpcService<CheckoutResult>('create_marketplace_checkout_from_hold', {
+      p_slug: body.slug,
+      p_hold_id: body.hold_id,
+      p_marketplace_session_id: session.marketplace_session_id,
+      p_verified_phone: session.verified_phone,
     });
   } catch (e) {
     return mapError(e);
   }
 
-  // Defensa en profundidad: el profesional re-resuelto por la RPC debe coincidir con el de la
-  // cookie (no mezclar profesionales dentro de un mismo flujo, MARKETPLACE.md § cookie).
-  if (session.professional_id && session.professional_id !== prep.professional_id) {
-    return flowError('BOOKING_SESSION_MISMATCH', 'restart_booking');
+  // 4) Rama "ya es paciente de ESTE profesional": la RPC expiró el hold y la devuelve como fila
+  //    (no excepción). La 1ª sesión de marketplace no aplica ⇒ continuar por WhatsApp (chatbot).
+  //    Token canónico del módulo: `continue_whatsapp` (MARKETPLACE.md §728/§733).
+  if (result.marketplace_allowed === false) {
+    return flowError(
+      result.reason ?? 'MARKETPLACE_BLOCKED_EXISTING_PATIENT',
+      result.next_action ?? 'continue_whatsapp',
+    );
   }
 
-  // 4) Idempotencia por hold: si ya había una Session, recuperarla de Stripe en vez de crear otra
-  //    (doble pestaña / reintento). `open` ⇒ continuar en su URL; `complete` ⇒ ya se pagó, ir a
-  //    resultado (polling); `expired` ⇒ CHECKOUT_EXPIRED (MARKETPLACE.md §768-770).
-  if (prep.has_existing_checkout && prep.stripe_checkout_session_id) {
-    return recoverExistingCheckout(prep.stripe_checkout_session_id, prep.hold);
-  }
-
-  // 5) Crear la Stripe Checkout Session. Precio/moneda/URLs 100% server-side; `amount` es el
-  //    snapshot congelado del hold. IdempotencyKey `marketplace_checkout:{hold_id}` (dentro del
-  //    helper) evita Sessions duplicadas ante reintentos de red.
-  let checkout: { stripeCheckoutSessionId: string; url: string; expiresAt: string };
-  try {
-    checkout = await createCheckoutFromHold({
-      holdId: body.hold_id,
-      slug: body.slug,
-      professionalId: prep.professional_id,
-      serviceId: prep.service_id,
-      marketplaceSessionId: prep.marketplace_session_id,
-      amount: prep.amount, // SNAPSHOT del hold (MARKETPLACE.md §766), no del cliente
-      professionalName: prep.professional_name ?? undefined,
-    });
-  } catch (e) {
-    return mapError(e);
-  }
-
-  // 6) Fase `attach` (PRIVILEGIADA): re-`FOR UPDATE`, persiste `stripe_checkout_session_id` y
-  //    alinea `expires_at`/`checkout_expires_at` a la ventana Stripe. Si entre `prepare` y aquí
-  //    otra pestaña adjuntó una Session distinta ⇒ CHECKOUT_ALREADY_STARTED: recuperamos la que
-  //    ganó la carrera (no cobramos dos veces). La Session que acabamos de crear queda huérfana
-  //    y Stripe la expira por TTL.
-  let attach: CheckoutAttachResult;
-  try {
-    attach = await rpcService<CheckoutAttachResult>('create_marketplace_checkout_from_hold', {
-      phase: 'attach',
-      hold_id: body.hold_id,
-      marketplace_session_id: session.marketplace_session_id,
-      stripe_checkout_session_id: checkout.stripeCheckoutSessionId,
-      checkout_expires_at: checkout.expiresAt, // alinea expires_at del hold a la ventana Stripe
-    });
-  } catch (e) {
-    if (e instanceof MarketplaceRpcError && e.code === 'CHECKOUT_ALREADY_STARTED') {
-      // Carrera: ganó otra pestaña. Recuperar la Session que quedó adjunta al hold.
-      const winning = await safeExistingSessionId(body.hold_id, session.marketplace_session_id);
-      if (winning) return recoverExistingCheckout(winning, prep.hold);
-      // No se pudo resolver la ganadora ⇒ que el cliente continúe el checkout existente.
-      return flowError('CHECKOUT_ALREADY_STARTED', 'continue_checkout');
-    }
-    return mapError(e);
-  }
-
-  // 7) Respuesta: SOLO la URL de Stripe + vencimiento + hold público. El cliente hace
-  //    `window.location = checkout.url`. NO devolvemos `stripe_checkout_session_id` (viaja solo en
-  //    la success URL que arma Stripe). Al volver, la pantalla de resultado hace POLLING; el
-  //    `success` de Stripe NO confirma la cita (MARKETPLACE.md §780, marketplace-pago.md §6).
-  return NextResponse.json(
-    {
-      checkout: { url: checkout.url, expires_at: checkout.expiresAt },
-      hold: attach.hold,
-      next_action: 'redirect_to_stripe' as const,
-    },
-    { status: 200, headers: { 'cache-control': 'no-store' } },
-  );
-}
-
-// -------------------------------------------------------------------------------------
-// Recuperación de un Checkout existente (idempotencia por hold / carrera de doble pestaña).
-// -------------------------------------------------------------------------------------
-
-/**
- * Consulta el estado de una Session ya adjunta al hold y decide la siguiente acción SIN crear
- * otra Session ni cobrar de nuevo (MARKETPLACE.md §768-770). No muta dominio: solo lee de Stripe.
- */
-async function recoverExistingCheckout(
-  stripeCheckoutSessionId: string,
-  hold: HoldPublic,
-): Promise<NextResponse> {
-  let s: { status: string | null; url: string | null; expires_at: number | null };
-  try {
-    const retrieved = await getStripe().checkout.sessions.retrieve(stripeCheckoutSessionId);
-    s = { status: retrieved.status ?? null, url: retrieved.url ?? null, expires_at: retrieved.expires_at ?? null };
-  } catch (err) {
-    // No poder consultar Stripe no debe filtrar internos; es un fallo del riel de pago.
-    return mapError(new StripeGatewayError('STRIPE_CHECKOUT_FAILED', 'No se pudo recuperar la Session.', err));
-  }
-
-  // `complete` ⇒ el pago ya ocurrió (el webhook confirma la cita); el cliente va a resultado a
-  // hacer polling, no reintenta pago.
-  if (s.status === 'complete') {
+  // 5) Pago ya completado (idempotencia por hold): no hay URL que abrir. El webhook confirma la
+  //    cita; el cliente va a la pantalla de resultado a hacer POLLING, no reintenta pago
+  //    (MARKETPLACE.md §780, marketplace-pago.md §6).
+  if (result.next_action === 'view_result' || result.checkout?.status === 'complete') {
     return NextResponse.json(
-      { next_action: 'poll_result' as const, hold },
+      { next_action: 'poll_result' as const, hold: result.hold ?? null },
       { status: 200, headers: { 'cache-control': 'no-store' } },
     );
   }
-  // `expired` ⇒ la ventana de Stripe venció sin pago ⇒ reiniciar reserva.
-  if (s.status === 'expired' || !s.url) {
-    return flowError('CHECKOUT_EXPIRED', 'restart_booking');
-  }
-  // `open` ⇒ continuar el pago en la MISMA URL (continue_checkout).
-  const expiresAt = s.expires_at ? new Date(s.expires_at * 1000).toISOString() : hold.expires_at;
+
+  // 6) Checkout listo (creado ⇒ redirect_to_checkout, o recuperado 'open' ⇒ continue_checkout):
+  //    SOLO la URL de Stripe + vencimiento + hold público. El cliente hace
+  //    `window.location = checkout.url`. NO devolvemos `stripe_checkout_session_id` (Invariante 5:
+  //    viaja solo en la success URL que arma Stripe). El `success` de Stripe NO confirma la cita.
+  const url = result.checkout?.url;
+  if (!url) return errorJson('CHECKOUT_FAILED', 500);
+  const nextAction =
+    result.next_action === 'continue_checkout' ? 'continue_checkout' : 'redirect_to_stripe';
   return NextResponse.json(
     {
-      checkout: { url: s.url, expires_at: expiresAt },
-      hold,
-      next_action: 'continue_checkout' as const,
+      checkout: { url, expires_at: result.checkout?.expires_at },
+      hold: result.hold ?? null,
+      next_action: nextAction as 'redirect_to_stripe' | 'continue_checkout',
     },
     { status: 200, headers: { 'cache-control': 'no-store' } },
   );
-}
-
-/**
- * Lee (best-effort) la `stripe_checkout_session_id` que quedó adjunta al hold tras perder una
- * carrera de `attach`. Reusa la fase `prepare` en modo idempotente: si el hold ya tiene Session,
- * la devuelve. Cualquier fallo ⇒ null (el caller cae a `continue_checkout` genérico).
- */
-async function safeExistingSessionId(
-  holdId: string,
-  marketplaceSessionId: string,
-): Promise<string | null> {
-  try {
-    const again = await rpcService<CheckoutPrepareResult>('create_marketplace_checkout_from_hold', {
-      phase: 'prepare',
-      hold_id: holdId,
-      marketplace_session_id: marketplaceSessionId,
-    });
-    return again.has_existing_checkout ? again.stripe_checkout_session_id : null;
-  } catch {
-    return null;
-  }
 }
 
 // -------------------------------------------------------------------------------------
@@ -360,16 +249,16 @@ function mapError(e: unknown): NextResponse {
         // El horario se liberó / la ventana de pago venció ⇒ reiniciar la reserva.
         return flowError(e.code, 'restart_booking');
       case 'CHECKOUT_ALREADY_STARTED':
-        // Ya hay Checkout en curso: el cliente continúa el pago existente (no se re-cobra).
+        // Ya hay Checkout en curso (carrera): el cliente continúa el pago existente (no se re-cobra).
         return flowError(e.code, 'continue_checkout');
       case 'MARKETPLACE_BLOCKED_EXISTING_PATIENT':
-        // El teléfono ya es paciente de ESTE profesional (whatsapp_links): la 1ª sesión de
-        // marketplace no aplica; el hold pasó a `expired`. Continúa por WhatsApp (chatbot).
-        // Token de flujo canónico del módulo: `continue_whatsapp` (MARKETPLACE.md §728/§733;
-        // mismo que /api/otp/verify y el router en agendar/page.tsx), no `whatsapp`.
+        // Defensa por si el contrato lo emitiera como RAISE en vez de fila: mismo token de flujo.
         return flowError(e.code, 'continue_whatsapp');
       case 'SLOT_UNAVAILABLE':
         return errorJson(e.code, 409);
+      case 'STRIPE_CHECKOUT_FAILED':
+        // Stripe rechazó/falló la creación de la Session (riel de pago externo).
+        return errorJson(e.code, 502);
       case 'BOOKING_SESSION_REQUIRED':
       case 'BOOKING_SESSION_EXPIRED':
       case 'BOOKING_SESSION_MISMATCH':
@@ -377,12 +266,6 @@ function mapError(e: unknown): NextResponse {
       default:
         return errorJson('CHECKOUT_FAILED', 500);
     }
-  }
-  if (e instanceof StripeGatewayError) {
-    // Falla del riel Stripe (crear/recuperar Session). 502: dependencia externa; 500 si es
-    // configuración ausente. Nunca se filtra el detalle interno de Stripe.
-    if (e.code === 'STRIPE_CONFIG_MISSING') return errorJson('CHECKOUT_FAILED', 500);
-    return errorJson('STRIPE_CHECKOUT_FAILED', 502);
   }
   // No es error de dominio (red/infra) ⇒ 500 opaco.
   return errorJson('CHECKOUT_FAILED', 500);

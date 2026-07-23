@@ -53,9 +53,9 @@ export const runtime = 'nodejs';
 
 // -------------------------------------------------------------------------------------
 // Tipos — espejo EXACTO de la salida de `create_or_replace_marketplace_slot_hold`
-// (MARKETPLACE.md ~L649). Se incluyen `marketplace_session_id`/`professional_id` porque el
-// RPC los re-resuelve/genera y el SERVIDOR los necesita para sellar la cookie; NO se
-// reenvían al cliente (solo viaja el sub-objeto `hold`).
+// (MARKETPLACE.md ~L649). El RPC devuelve `marketplace_session_id`/`professional_id` dentro
+// del sub-objeto `cookie` (los re-resuelve/genera) porque el SERVIDOR los necesita para sellar
+// la cookie del flujo; NO se reenvían al cliente (solo viaja el sub-objeto `hold`).
 // -------------------------------------------------------------------------------------
 
 /** Estado del hold (MARKETPLACE.md § hold_status): al crear siempre entra en `held`. */
@@ -72,11 +72,18 @@ interface HoldPublic {
   status: HoldStatus;
 }
 
-/** Salida completa del RPC (server-side). */
+/** Campos de cookie que devuelve el RPC para que el SERVIDOR re-selle la sesión del flujo. */
+interface HoldCookieFields {
+  marketplace_session_id: string; // el RPC lo genera si la cookie no traía uno vigente
+  active_hold_id: string;
+  professional_id: string; // re-resuelto desde el slug — NUNCA se confía al cliente
+  expires_at: string;
+}
+
+/** Salida completa del RPC (server-side) — espejo del jsonb que arma la función. */
 interface HoldRpcResult {
   hold: HoldPublic;
-  marketplace_session_id: string; // el RPC lo genera si la cookie no traía uno vigente
-  professional_id: string; // re-resuelto desde el slug — NUNCA se confía al cliente
+  cookie: HoldCookieFields;
   cookie_updated: true;
 }
 
@@ -166,13 +173,13 @@ export async function POST(req: Request): Promise<NextResponse> {
   let result: HoldRpcResult;
   try {
     result = await rpcService<HoldRpcResult>('create_or_replace_marketplace_slot_hold', {
-      // Los nombres de estos parámetros ligan con la firma SQL de la función.
-      slug: body.slug,
-      starts_at: body.starts_at, // el RPC re-resuelve professional/service/ends_at/precio/tz
-      first_name: body.first_name ?? null,
-      last_name: body.last_name ?? null,
-      marketplace_session_id: current?.marketplace_session_id ?? null, // null ⇒ el RPC lo genera
-      ip_address: ip, // append-only en otp_send_attempts(kind='hold'); tope por IP/ventana
+      // Los nombres de estos parámetros ligan con la firma SQL de la función (prefijo p_).
+      p_slug: body.slug,
+      p_starts_at: body.starts_at, // el RPC re-resuelve professional/service/ends_at/precio/tz
+      p_first_name: body.first_name ?? null,
+      p_last_name: body.last_name ?? null,
+      p_marketplace_session_id: current?.marketplace_session_id ?? null, // null ⇒ el RPC lo genera
+      p_ip_address: ip, // append-only en otp_send_attempts(kind='hold'); tope por IP/ventana
     });
   } catch (e) {
     return mapRpcError(e);
@@ -184,13 +191,13 @@ export async function POST(req: Request): Promise<NextResponse> {
   //    affinity_filters, etc.). Fuente de verdad del hold sigue siendo la DB, no esta cookie.
   try {
     const sameSession =
-      current != null && current.marketplace_session_id === result.marketplace_session_id;
+      current != null && current.marketplace_session_id === result.cookie.marketplace_session_id;
 
     if (sameSession) {
       // Refresco dentro de la misma sesión ⇒ patch con version++ (setBookingSession valida el
       // invariante de no-mezcla de profesionales: si difiere ⇒ BOOKING_SESSION_MISMATCH).
       await setBookingSession({
-        professional_id: result.professional_id,
+        professional_id: result.cookie.professional_id,
         active_hold_id: result.hold.id,
         first_name: body.first_name ?? current!.first_name,
         last_name: body.last_name ?? current!.last_name,
@@ -200,8 +207,8 @@ export async function POST(req: Request): Promise<NextResponse> {
       // GENERÓ el RPC, para que cookie y DB compartan la MISMA ancla del flujo. Reemplazo
       // deliberado (no aplica el guard de mismatch: es el inicio de un flujo).
       await replaceBookingSession({
-        marketplace_session_id: result.marketplace_session_id,
-        professional_id: result.professional_id,
+        marketplace_session_id: result.cookie.marketplace_session_id,
+        professional_id: result.cookie.professional_id,
         active_hold_id: result.hold.id,
         first_name: body.first_name ?? current?.first_name ?? null,
         last_name: body.last_name ?? current?.last_name ?? null,
