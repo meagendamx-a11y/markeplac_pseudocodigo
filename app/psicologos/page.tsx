@@ -3,7 +3,8 @@
 //
 // Contrato: paginas/marketplace-listado.md (ruta /psicologos, estados, jerarquía, "No debe")
 //           + MARKETPLACE.md § search_marketplace_profiles (~L376-448): entrada, salida,
-//           rotación diaria, rating FUERA del ORDER BY, relaxed_filters, SIN slots en tarjeta.
+//           rotación diaria, rating FUERA del ORDER BY, relaxed_filters, ≤3
+//           next_available_slots por tarjeta (nunca el calendario completo, D-B revisada).
 //
 // Responsabilidad (y SOLO esto): Server Component que
 //   1. traduce los searchParams de la URL a la entrada de `search_marketplace_profiles`,
@@ -58,7 +59,18 @@ export interface MarketplaceService {
   duration_minutes: number;
 }
 
-/** Una tarjeta del directorio. NO trae teléfono/INE/slots/fixed_meeting_url (allowlist §L439). */
+/**
+ * Uno de los ≤3 horarios MÁS PRÓXIMOS de la tarjeta (decisión revisada de D-B, ver
+ * MARKETPLACE.md § search_marketplace_profiles). Es informativo: NO navega directo a
+ * crear un hold — el botón «Elegir horario» siempre revalida disponibilidad real en
+ * /psicologos/:slug/agendar/horarios. Nunca representa el calendario completo.
+ */
+export interface NextAvailableSlot {
+  starts_at: string; // ISO UTC
+  starts_at_local: string; // hora LOCAL del profesional, sin Z/offset (ya resuelta por el backend)
+}
+
+/** Una tarjeta del directorio. NO trae teléfono/INE/fixed_meeting_url (allowlist §L439). */
 export interface DirectoryProfile {
   slug: string;
   display_name: string;
@@ -73,6 +85,8 @@ export interface DirectoryProfile {
   };
   rating: ProfileRating;
   marketplace_service: MarketplaceService;
+  /** ≤3 horarios más próximos, orden ascendente. [] ⇒ "Sin horarios disponibles próximamente". */
+  next_available_slots: NextAvailableSlot[];
 }
 
 /** Qué dimensiones soltó la relajación progresiva: `none` | lista | `all` (~L426). */

@@ -1,6 +1,6 @@
 import Link from 'next/link';
 
-import type { DirectoryProfile } from '../app/psicologos/page';
+import type { DirectoryProfile, NextAvailableSlot } from '../app/psicologos/page';
 
 /** Precio en MXN sin decimales. Cifras tabulares vía la clase `.num` en el nodo contenedor. */
 function formatPrice(mxn: number): string {
@@ -19,6 +19,49 @@ function initials(name: string): string {
     .slice(0, 2)
     .map((w) => w[0]?.toUpperCase() ?? '')
     .join('');
+}
+
+/**
+ * Etiqueta corta "Hoy · 17:00" / "Mañana · 10:00" / "Mié 16 · 16:00" a partir de
+ * `starts_at_local` (naive, ya en hora local del profesional — no se re-convierte tz
+ * aquí). Compara por fecha calendario, no por 24h exactas, para que "Hoy"/"Mañana"
+ * coincidan con la percepción del paciente.
+ */
+function formatSlotChip(starts_at_local: string): string {
+  const [datePart, timePart] = starts_at_local.split('T');
+  const slot = new Date(`${datePart}T00:00:00`);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const diffDays = Math.round((slot.getTime() - today.getTime()) / 86_400_000);
+  const hhmm = (timePart ?? '00:00:00').slice(0, 5);
+
+  if (diffDays === 0) return `Hoy · ${hhmm}`;
+  if (diffDays === 1) return `Mañana · ${hhmm}`;
+  const weekday = new Intl.DateTimeFormat('es-MX', { weekday: 'short' }).format(slot);
+  return `${weekday.charAt(0).toUpperCase()}${weekday.slice(1)} ${slot.getDate()} · ${hhmm}`;
+}
+
+// Chip informativo de horario próximo. NO es un link (§MARKETPLACE.md D-B: los chips no
+// navegan directo a crear un hold; "Elegir horario" siempre revalida disponibilidad real).
+function SlotChip({ slot }: { slot: NextAvailableSlot }) {
+  return (
+    <span
+      className="num"
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        padding: '4px var(--s12)',
+        background: 'var(--purple-100)',
+        color: 'var(--purple-700)',
+        borderRadius: 'var(--radius-round)',
+        fontSize: 13,
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {formatSlotChip(slot.starts_at_local)}
+    </span>
+  );
 }
 
 // Chip descriptivo (área / enfoque). Fondo tintado --ink-100; etiqueta de contenido, NO acción.
@@ -45,12 +88,13 @@ function DescriptorChip({ label }: { label: string }) {
 export function ProfileCard({ profile }: { profile: DirectoryProfile }) {
   const {
     slug, display_name, photo_url, is_verified, years_experience,
-    about_me_excerpt, catalog, rating, marketplace_service,
+    about_me_excerpt, catalog, rating, marketplace_service, next_available_slots,
   } = profile;
 
   const perfilHref = `/psicologos/${slug}`;
   const horarioHref = `/psicologos/${slug}/agendar`;
   const hasReviews = rating.count > 0;
+  const hasSlots = next_available_slots.length > 0;
   const serviceLine = [
     marketplace_service.display_name, 'En línea', `${marketplace_service.duration_minutes} min`,
   ].join(' · ');
@@ -116,9 +160,27 @@ export function ProfileCard({ profile }: { profile: DirectoryProfile }) {
         </span>
       </div>
 
+      {/*
+        Próximos horarios (decisión revisada de D-B, ver MARKETPLACE.md). Informativo,
+        NO clicable: los chips nunca navegan directo a crear un hold. Vacío ⇒ mensaje +
+        se oculta "Elegir horario" (solo queda "Ver perfil").
+      */}
+      {hasSlots ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--s8)' }}>
+          <span style={{ color: 'var(--ink-500)', fontSize: 13, fontWeight: 500 }}>Próximos horarios</span>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--s8)' }}>
+            {next_available_slots.map((s) => <SlotChip key={s.starts_at} slot={s} />)}
+          </div>
+        </div>
+      ) : (
+        <span style={{ color: 'var(--ink-500)', fontSize: 13 }}>Sin horarios disponibles próximamente</span>
+      )}
+
       <div style={{ display: 'flex', gap: 'var(--s12)', marginTop: 'var(--s4)' }}>
         <Link href={perfilHref} className="btn-secondary" style={{ flex: 1, textDecoration: 'none' }}>Ver perfil</Link>
-        <Link href={horarioHref} className="btn-secondary" style={{ flex: 1, textDecoration: 'none' }}>Elegir horario</Link>
+        {hasSlots && (
+          <Link href={horarioHref} className="cta-primary" style={{ flex: 1, textDecoration: 'none' }}>Elegir horario</Link>
+        )}
       </div>
     </article>
   );
